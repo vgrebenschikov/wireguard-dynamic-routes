@@ -1,0 +1,254 @@
+#!/usr/local/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+#
+
+set -e -o pipefail
+shopt -s extglob
+export LC_ALL=C
+
+exec 3>&2
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+export PATH="${SELF%/*}:$PATH"
+
+WG_CONFIG=""
+INTERFACE=""
+TABLE=""
+CONFIG_FILE=""
+PROGRAM="${0##*/}"
+ARGS=( "$@" )
+DEBUG=false
+
+declare -A ROUTES
+
+PEER_TIMEOUT=180
+
+cmd() {
+	echo "[#] $*" >&3
+	"$@"
+}
+
+die() {
+	echo "$PROGRAM: $*" >&2
+	exit 1
+}
+
+debug() {
+	$DEBUG && echo "$@" >&3 || true
+}
+
+
+log() {
+	echo "$@" >&3
+}
+
+CONFIG_SEARCH_PATHS=( /etc/wireguard /usr/local/etc/wireguard )
+
+parse_options() {
+	local interface_section=0 line key value stripped path v last_public_key 
+	CONFIG_FILE="$1"
+	if [[ $CONFIG_FILE =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]]; then
+		for path in "${CONFIG_SEARCH_PATHS[@]}"; do
+			CONFIG_FILE="$path/$1.conf"
+			[[ -e $CONFIG_FILE ]] && break
+		done
+	fi
+	[[ -e $CONFIG_FILE ]] || die "\`$CONFIG_FILE' does not exist"
+	[[ $CONFIG_FILE =~ (^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]] || die "The config file must be a valid interface name, followed by .conf"
+	CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
+	((($(stat -f '0%#p' "$CONFIG_FILE") & $(stat -f '0%#p' "${CONFIG_FILE%/*}") & 0007) == 0)) || echo "Warning: \`$CONFIG_FILE' is world accessible" >&2
+	INTERFACE="${BASH_REMATCH[2]}"
+	shopt -s nocasematch
+	while read -r line || [[ -n $line ]]; do
+		stripped="${line%%\#*}"
+		key="${stripped%%=*}"; key="${key##*([[:space:]])}"; key="${key%%*([[:space:]])}"
+		value="${stripped#*=}"; value="${value##*([[:space:]])}"; value="${value%%*([[:space:]])}"
+		[[ $key == "["* ]] && interface_section=0 && last_public_key=""
+		[[ $key == "[Interface]" ]] && interface_section=1
+		if [[ $interface_section -eq 1 ]]; then
+			case "$key" in
+			Address) continue ;;
+			MTU) continue ;; 
+			DNS) continue ;;
+			Table) TABLE="$value"; continue ;;
+			PreUp) continue ;;
+			PreDown) continue ;;
+			PostUp) continue ;;
+			PostDown) continue ;;
+			SaveConfig) read_bool SAVE_CONFIG "$value"; continue ;;
+			esac
+		else
+			case "$key" in
+			PublicKey) last_public_key="$value" ;;
+			DynamicRoutes) ROUTES["$last_public_key"]="$value"; continue ;;
+			Routes) continue ;;
+			esac
+		fi
+		WG_CONFIG+="$line"$'\n'
+	done < "$CONFIG_FILE"
+	shopt -u nocasematch
+}
+
+del_routes() {
+	local todelete=( ) destination gateway netif
+	while read -r destination _ _ _ _ netif _; do
+		[[ $netif == "$INTERFACE" ]] && todelete+=( "$destination" )
+	done < <(netstat -nr -f inet)
+	for destination in "${todelete[@]}"; do
+		cmd route -q -n delete -inet "$destination" || true
+	done
+	todelete=( )
+	while read -r destination gateway _ netif; do
+		[[ $netif == "$INTERFACE" || ( $netif == lo* && $gateway == "$INTERFACE" ) ]] && todelete+=( "$destination" )
+	done < <(netstat -nr -f inet6)
+	for destination in "${todelete[@]}"; do
+		cmd route -q -n delete -inet6 "$destination" || true
+	done
+	for destination in "${ENDPOINTS[@]}"; do
+		if [[ $destination == *:* ]]; then
+			cmd route -q -n delete -inet6 "$destination" || true
+		else
+			cmd route -q -n delete -inet "$destination" || true
+		fi
+	done
+}
+
+monitor_daemon() {
+	echo "[+] Backgrounding route monitor" >&2
+	(make_temp
+	trap 'del_routes; clean_temp; exit 0' INT TERM EXIT
+	exec >/dev/null 2>&1
+	exec 19< <(exec route -n monitor)
+	local event pid=$!
+	# TODO: this should also check to see if the endpoint actually changes
+	# in response to incoming packets, and then call set_endpoint_direct_route
+	# then too. That function should be able to gracefully cleanup if the
+	# endpoints change.
+	while read -u 19 -r event; do
+		[[ $event == RTM_* ]] || continue
+		ifconfig "$INTERFACE" >/dev/null 2>&1 || break
+		[[ $AUTO_ROUTE4 -eq 1 || $AUTO_ROUTE6 -eq 1 ]] && set_endpoint_direct_route
+		# TODO: set the mtu as well, but only if up
+	done
+	kill $pid) & disown
+}
+
+
+cmd_usage() {
+	cat >&2 <<-_EOF
+	Usage: $PROGRAM [ CONFIG_FILE | INTERFACE ]
+	
+	Options:
+		-h | --help	- show this help
+		-d | --debug	- debug log level
+
+	_EOF
+}
+
+
+add_route() {
+        [[ $TABLE != off ]] || return 0
+
+        local family=inet
+        [[ $1 == *:* ]] && family=inet6
+
+        if [[ -n $TABLE && $TABLE != auto ]]; then
+                cmd route -q -n add "-$family" -fib "$TABLE" "$1" -interface "$INTERFACE"
+        elif [[ $1 == */0 ]]; then
+                if [[ $1 == *:* ]]; then
+                        AUTO_ROUTE6=1
+                        cmd route -q -n add -inet6 ::/1 -interface "$INTERFACE"
+                        cmd route -q -n add -inet6 8000::/1 -interface "$INTERFACE"
+                else
+                        AUTO_ROUTE4=1
+                        cmd route -q -n add -inet 0.0.0.0/1 -interface "$INTERFACE"
+                        cmd route -q -n add -inet 128.0.0.0/1 -interface "$INTERFACE"
+                fi
+        else
+                [[ $(route -n get "-$family" "$1" 2>/dev/null) =~ interface:\ $INTERFACE$'\n' ]] || cmd route -q -n add "-$family" "$1" -interface "$INTERFACE" || echo " - failed"
+        fi
+}
+
+check_peers() {
+	local now rt has_route our_route family fib=""
+	
+	[[ -n $TABLE && $table != auto ]] && fib="-fib $TABLE"
+
+	now=$(date '+%s')
+	while read pub_key latest_handshakes; do
+		if [[ -v "ROUTES[$pub_key]" ]]; then
+			[[ $(( $now - $latest_handshakes )) -gt $PEER_TIMEOUT ]] && expire=true || expire=false
+			
+			for r in ${ROUTES[$pub_key]}; do
+				family=inet
+			        [[ $r == *:* ]] && family=inet6
+
+				rt=$(route -q -n get $r 2> /dev/null) && has_route=true || has_route=false
+				[[ $(echo "$rt") =~ interface:\ $INTERFACE$'\n' ]] && our_route=true || our_route=false
+				
+				debug "Peer: $pub_key  LastHandshake: $(( $now - $latest_handshakes ))  Expire: $expire  Has-route: $has_route  Our-route: $our_route"
+				
+				if $expire; then
+					debug "Peer $pub_key is expired"
+					
+					if ! $has_route || ! $our_route; then
+						debug "No wireguard route $r - expected"
+					else
+						if $has_route && $our_route; then
+							log "Removing expired wireguard route $r"
+							cmd route -n -q delete "-$family" $fib $r -interface $INTERFACE
+						fi
+					fi
+				else
+					debug "Peer $pub_key is alive"
+					
+					if $has_route && $our_route; then
+						debug "Route $r is ok"
+					else
+						if $has_route; then
+							log "Route is wrong $r - removing"
+							cmd route -q -n delete "-$family" $fib $r
+						fi
+						log "Adding route $r"
+						cmd route -q -n add "-$family" $fib $r -interface $INTERFACE
+					fi
+				fi
+					
+					
+			done			
+		fi
+	done < <(wg show wg0 latest-handshakes)
+}
+
+cmd_track_peers() {
+	while true; do
+		check_peers
+		debug
+
+		sleep 3
+	done
+}
+
+# ~~ function override insertion point ~~
+
+if [[ $# -eq 1 && ( $1 == --help || $1 == -h || $1 == help ) ]]; then
+	cmd_usage
+	exit 0
+fi
+
+if [[ "$1" == "-d" || "$1" == "--debug" ]]; then
+	DEBUG=true
+	shift
+fi
+
+
+if [[ $# -eq 1 ]]; then
+	parse_options "$1"
+	cmd_track_peers
+else
+	cmd_usage
+	exit 1
+fi
+
+exit 0

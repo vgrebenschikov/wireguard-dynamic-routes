@@ -1,0 +1,30 @@
+#!/bin/sh
+
+# PROVIDE: wireguard-dynamic-routes
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following line to /etc/rc.conf[.local] to enable wireguard_dynamic_routes:
+#
+# wireguard_dynamic_routes_enable="YES"
+# wireguard_dynamic_routes_interface="wg0"
+
+
+echo "$0 >>> $@"
+. /etc/rc.subr
+
+name=wireguard_dynamic_routes
+rcvar=wireguard_dynamic_routes_enable
+
+load_rc_config $name
+
+wireguard_dynamic_routes_enable=${wireguard_dynamic_routes_enable-"NO"}
+wireguard_dynamic_routes_interface=${wireguard_dynamic_routes_interface-"wg0"}
+
+command=/usr/sbin/daemon
+pidfile="/var/run/wg-dynamic-routes.pid"
+command_args="-s info -l local0 -T wg-dynamic-routes -P ${pidfile} /usr/local/bin/wg-dynamic-routes ${wireguard_dynamic_routes_interface}"
+
+stop_postcmd="rm -f $pidfile"
+
+run_rc_command $1
